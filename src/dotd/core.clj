@@ -112,10 +112,12 @@
   (let [{:keys [c-send c-receive channel]} (start-server 53)]
     (def c channel)
     (async/go-loop []
-      (let [req (async/<! c-receive)]
-        (async/go
-          (if-let [resp (dispatch cloudflare req)]
-            (async/>! c-send resp)
-            (async/>! c-receive req))))
+      (let [req (async/<! c-receive)
+            retries (or (:retries (meta req)) 0)]
+        (when (< retries 10)
+          (async/go
+            (if-let [resp (dispatch cloudflare req)]
+              (async/>! c-send resp)
+              (async/>! c-receive (with-meta req {:retries (inc retries)}))))))
       (recur))
     (async/<!! (async/chan 1))))
