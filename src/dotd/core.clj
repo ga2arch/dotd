@@ -2,16 +2,17 @@
   (:require [clojure.tools.logging :as log]
             [clojure.core.async :as async]
             [clojure.core.cache :as cache])
-  (:import (java.nio.channels DatagramChannel)
-           (java.net InetSocketAddress)
+  (:import (java.nio.channels DatagramChannel SocketChannel)
+           (java.net InetSocketAddress SocketOptions StandardSocketOptions)
            (java.nio ByteBuffer ByteOrder)
-           (javax.net.ssl SSLSocketFactory SSLSocket)
+           (javax.net.ssl SSLSocketFactory SSLSocket SSLContext)
            (java.io DataOutputStream DataInputStream)
            (net.openhft.hashing LongHashFunction)
-           (java.util Date))
+           (tlschannel ClientTlsChannel))
   (:gen-class))
 
 (def cloudflare "1.1.1.1")
+(def connection (atom nil))
 (def request->response (atom (cache/ttl-cache-factory {} :ttl (* 10 60 1000))))
 
 (defn hash-request
@@ -58,54 +59,68 @@
      :channel   channel}))
 
 (defn connect
-  [provider]
-  (let [ssl-factory (SSLSocketFactory/getDefault)
-        ^SSLSocket socket (.createSocket ssl-factory provider 853)]
-    (doto socket
-      (.setUseClientMode true)
-      (.setKeepAlive true)
-      (.setTcpNoDelay true)
-      (.startHandshake))
-    {:in     (DataInputStream. (.getInputStream socket))
-     :out    (DataOutputStream. (.getOutputStream socket))
-     :socket socket}))
+  [^String provider]
+  (let [^SSLContext ssl-ctx (SSLContext/getDefault)
+        ^SocketChannel channel (doto (SocketChannel/open)
+                                 (.connect (InetSocketAddress. provider 853)))
+        tls-channel (-> (ClientTlsChannel/newBuilder channel ssl-ctx)
+                        (.build))]
+    (doto channel
+      (.setOption StandardSocketOptions/TCP_NODELAY true))
+    {:channel tls-channel
+     :socket  channel}))
 
-(defn close
-  [{:keys [socket in out]}]
-  (.close in)
-  (.close out)
-  (.close socket))
+(defn close-connection
+  []
+  (when-let [conn @connection]
+    (do
+      (.close (:channel conn))
+      (.close (:socket conn))
+      (reset! connection nil))))
+
+(defn get-connection
+  [^String provider]
+  (if-let [conn @connection]
+    (if (.isOpen (:channel conn))
+      conn
+      (reset! connection (connect provider)))
+    (reset! connection (connect provider))))
 
 (defn resolve-dns
-  [{:keys [in out]} {:keys [addr ^ByteBuffer request]}]
-  (let [len (.remaining request)]
-    (doto out
-      (.writeShort len)
-      (.write (.array request))
-      (.flush))
-    (let [buff (byte-array 512)]
-      (.skipBytes in 2)
-      (let [n (.read in buff)]
-        (when (pos? n)
-          (let [response (doto
-                           (ByteBuffer/wrap buff)
-                           (.order ByteOrder/BIG_ENDIAN)
-                           (.position n)
-                           (.flip))]
+  [{:keys [^ClientTlsChannel channel]} {:keys [addr ^ByteBuffer request]}]
+  (let [len (.remaining request)
+        req (doto (ByteBuffer/allocate (+ 2 len))
+              (.order ByteOrder/BIG_ENDIAN)
+              (.putShort len)
+              (.put request)
+              (.rewind))
+        written (.write channel req)]
+    (.rewind request)
+    (let [buff (doto
+                 (ByteBuffer/allocate 512)
+                 (.order ByteOrder/BIG_ENDIAN))]
+      (let [n (.read channel buff)]
+        (if (= -1 n)
+          (close-connection)
+          (let [response (doto buff
+                           (.flip)
+                           (.position 2)
+                           (.compact))]
             (swap! request->response assoc (hash-request request) response)
             {:request  request
              :response response
              :addr     addr}))))))
 
 (defn dispatch
-  [provider req]
-  (let [conn (connect provider)]
-    (try
-      (resolve-dns conn req)
-      (catch Exception e
-        (log/error "error resolving dns for req: " (String. (.array req)) e))
-      (finally
-        (close conn)))))
+  [provider conn req]
+  (try
+    (resolve-dns conn req)
+    (catch Exception e
+      (log/error "error resolving dns for req: " req e)
+      (close-connection))
+    (finally
+      ;(close conn)
+      )))
 
 (defn -main
   []
@@ -115,9 +130,11 @@
       (let [req (async/<! c-receive)
             retries (or (:retries (meta req)) 0)]
         (when (< retries 10)
-          (async/go
-            (if-let [resp (dispatch cloudflare req)]
-              (async/>! c-send resp)
-              (async/>! c-receive (with-meta req {:retries (inc retries)}))))))
+          (let [conn (get-connection cloudflare)]
+            (async/go
+              (if-let [resp (dispatch cloudflare conn req)]
+                (async/>! c-send resp)
+                (async/>! c-receive (with-meta req {:retries (inc retries)})))))))
       (recur))
-    (async/<!! (async/chan 1))))
+    (async/<!! (async/chan 1))
+    ))

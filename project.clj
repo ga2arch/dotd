@@ -8,5 +8,6 @@
                  [org.clojure/core.cache "0.7.2"]
                  [org.clojure/tools.logging "0.4.1"]
                  [org.slf4j/slf4j-log4j12 "1.8.0-beta4"]
+                 [com.github.marianobarrios/tls-channel "0.2.0"]
                  [net.openhft/zero-allocation-hashing "0.9"]]
   :main dotd.core)
