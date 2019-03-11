@@ -7,13 +7,14 @@
            (java.nio ByteBuffer ByteOrder)
            (javax.net.ssl SSLSocketFactory SSLSocket)
            (java.io DataOutputStream DataInputStream)
-           (net.openhft.hashing LongHashFunction))
+           (net.openhft.hashing LongHashFunction)
+           (java.util Date))
   (:gen-class))
 
 (def cloudflare "1.1.1.1")
-(def C1 (atom (cache/ttl-cache-factory {} :ttl 10000)))
+(def request->response (atom (cache/ttl-cache-factory {} :ttl (* 10 60 1000))))
 
-(defn hash-packet
+(defn hash-request
   [^ByteBuffer packet]
   (.rewind packet)
   (.position packet 4)
@@ -22,29 +23,29 @@
     h))
 
 (defn start-server
-  []
+  [port]
   (let [channel (DatagramChannel/open)
-        in (async/chan 1)
-        out (async/chan 1)]
+        c-send (async/chan 1)
+        c-receive (async/chan 1)]
     (-> channel
         (.socket)
-        (.bind (InetSocketAddress. 53)))
-    (log/info "listening on port :53")
+        (.bind (InetSocketAddress. port)))
+    (log/info "listening on port:" port)
     (async/go-loop []
-      (let [request (ByteBuffer/allocate 512)]
-        (.order request ByteOrder/BIG_ENDIAN)
-        (.clear request)
+      (let [request (doto
+                      (ByteBuffer/allocate 512)
+                      (.order ByteOrder/BIG_ENDIAN))]
         (let [addr (.receive channel request)]
           (.flip request)
-          (if-let [response (get @C1 (hash-packet request))]
-            (async/>! in {:addr     addr
-                          :request  request
-                          :response response})
-            (async/>! out {:addr    addr
-                           :request request}))))
+          (if-let [response (get @request->response (hash-request request))]
+            (async/>! c-send {:addr     addr
+                              :request  request
+                              :response response})
+            (async/>! c-receive {:addr    addr
+                                 :request request}))))
       (recur))
     (async/go-loop []
-      (let [{:keys [addr request response]} (async/<! in)]
+      (let [{:keys [addr request response]} (async/<! c-send)]
         (.rewind request)
         (doto response
           (.rewind)
@@ -52,19 +53,28 @@
           (.rewind))
         (.send channel response addr)
         (recur)))
-    {:in      in
-     :out     out
-     :channel channel}))
+    {:c-send    c-send
+     :c-receive c-receive
+     :channel   channel}))
 
-(defn connect-provider
+(defn connect
   [provider]
   (let [ssl-factory (SSLSocketFactory/getDefault)
         ^SSLSocket socket (.createSocket ssl-factory provider 853)]
-    (.setUseClientMode socket true)
-    (.startHandshake socket)
-    {:socket socket
-     :in     (DataInputStream. (.getInputStream socket))
-     :out    (DataOutputStream. (.getOutputStream socket))}))
+    (doto socket
+      (.setUseClientMode true)
+      (.setKeepAlive true)
+      (.setTcpNoDelay true)
+      (.startHandshake))
+    {:in     (DataInputStream. (.getInputStream socket))
+     :out    (DataOutputStream. (.getOutputStream socket))
+     :socket socket}))
+
+(defn close
+  [{:keys [socket in out]}]
+  (.close in)
+  (.close out)
+  (.close socket))
 
 (defn resolve-dns
   [{:keys [in out]} {:keys [addr ^ByteBuffer request]}]
@@ -82,27 +92,30 @@
                            (.order ByteOrder/BIG_ENDIAN)
                            (.position n)
                            (.flip))]
-            (swap! C1 assoc (hash-packet request) response)
+            (swap! request->response assoc (hash-request request) response)
             {:request  request
              :response response
              :addr     addr}))))))
 
 (defn dispatch
   [provider req]
-  (let [{:keys [socket in out] :as conn} (connect-provider provider)]
+  (let [conn (connect provider)]
     (try
       (resolve-dns conn req)
+      (catch Exception e
+        (log/error "error resolving dns for req: " (String. (.array req)) e))
       (finally
-        (.close in)
-        (.close out)
-        (.close socket)))))
+        (close conn)))))
 
 (defn -main
   []
-  (let [{:keys [in out channel]} (start-server)
-        xf (comp
-             (map (partial dispatch cloudflare))
-             (filter (complement nil?)))]
+  (let [{:keys [c-send c-receive channel]} (start-server 53)]
     (def c channel)
-    (async/pipeline-blocking 10 in xf out)
+    (async/go-loop []
+      (let [req (async/<! c-receive)]
+        (async/go
+          (if-let [resp (dispatch cloudflare req)]
+            (async/>! c-send resp)
+            (async/>! c-receive req))))
+      (recur))
     (async/<!! (async/chan 1))))
