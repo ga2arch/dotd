@@ -93,9 +93,9 @@
               (.order ByteOrder/BIG_ENDIAN)
               (.putShort len)
               (.put request)
-              (.rewind))
-        written (.write channel req)]
+              (.rewind))]
     (.rewind request)
+    (.write channel req)
     (let [buff (doto
                  (ByteBuffer/allocate 512)
                  (.order ByteOrder/BIG_ENDIAN))]
