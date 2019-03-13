@@ -6,19 +6,6 @@
            (javax.net.ssl SSLEngine SSLContext SSLEngineResult SSLEngineResult$HandshakeStatus)
            (tlschannel SniSslContextFactory)))
 
-(defn prepare-buffers
-  [& buffs]
-  (doseq [^ByteBuffer buff buffs]
-    (doto buff
-      (.flip))))
-
-(defn enlarge-buffer
-  [^ByteBuffer buffer size]
-  (let [new-buff (ByteBuffer/allocate (+ size (.position buffer)))]
-    (.flip buffer)
-    (.put new-buff buffer)
-    new-buff))
-
 (defn get-result-status
   [result]
   (keyword (.name (.getStatus result))))
@@ -32,46 +19,41 @@
 
 (defmethod handshake [:NEED_WRAP] [{:keys [ssl-engine packet-buffer-dst app-buffer-src] :as state} status]
   (println status)
-  (.clear packet-buffer-dst)
-  (.flip app-buffer-src)
   (let [^SSLEngineResult result (.wrap ssl-engine app-buffer-src packet-buffer-dst)]
     [state [:NEED_WRAP (get-result-status result)]]))
 
-(defmethod handshake [:NEED_WRAP :OK] [{:keys [ssl-engine channel packet-buffer-dst] :as state} status]
+(defmethod handshake [:NEED_WRAP :OK] [{:keys [ssl-engine channel app-buffer-src packet-buffer-dst] :as state} status]
   (println status)
+  (.clear app-buffer-src)
   (.flip packet-buffer-dst)
-  (println packet-buffer-dst (String. (.array packet-buffer-dst)))
-  (.write channel packet-buffer-dst)
+  (while (.hasRemaining packet-buffer-dst)
+    (.write channel packet-buffer-dst))
   (.compact packet-buffer-dst)
   [state (get-handshake-status ssl-engine)])
 
-(defmethod handshake [:NEED_UNWRAP] [{:keys [ssl-engine channel packet-buffer-src app-buffer-dst] :as state} status]
+(defmethod handshake [:NEED_UNWRAP] [{:keys [ssl-engine packet-buffer-src app-buffer-dst] :as state} status]
   (println status)
-  (println packet-buffer-src)
-  (.read channel packet-buffer-src)
   (.flip packet-buffer-src)
-  (println packet-buffer-src (String. (.array packet-buffer-src)))
   (let [^SSLEngineResult result (.unwrap ssl-engine packet-buffer-src app-buffer-dst)]
-    (println packet-buffer-src)
     [state [:NEED_UNWRAP (get-result-status result)]]))
 
 (defmethod handshake [:NEED_UNWRAP :OK] [{:keys [ssl-engine app-buffer-dst packet-buffer-src] :as state} status]
   (println status)
   (.compact packet-buffer-src)
-  (println (String. (.array app-buffer-dst)))
+  (.clear app-buffer-dst)
   [state (get-handshake-status ssl-engine)])
 
-(defmethod handshake [:NEED_UNWRAP :BUFFER_UNDERFLOW] [{:keys [ssl-engine packet-buffer-src] :as state} status]
+(defmethod handshake [:NEED_UNWRAP :BUFFER_UNDERFLOW] [{:keys [ssl-engine channel packet-buffer-src] :as state} status]
   (println status)
-  (println packet-buffer-src)
+  (.compact packet-buffer-src)
   (let [net-size (-> (.getSession ssl-engine)
-                     (.getPacketBufferSize))]
-    (if (> net-size (.capacity packet-buffer-src))
-      (do
-        (let [pbs (doto (ByteBuffer/allocate net-size)
-                    (.put packet-buffer-src))]
-          (reduced [(assoc state :packet-buffer-src pbs) [:NEED_UNWRAP]])))
-      (reduced [state [:NEED_UNWRAP]]))))
+                     (.getPacketBufferSize))
+        pbs (if (> net-size (.capacity packet-buffer-src))
+              (doto (ByteBuffer/allocate net-size)
+                (.put packet-buffer-src))
+              packet-buffer-src)]
+    (let [n (.read channel pbs)]
+      [state [:NEED_UNWRAP]])))
 
 (defmethod handshake [:NEED_UNWRAP :BUFFER_OVERFLOW] [{:keys [ssl-engine packet-buffer-src app-buffer-dst] :as state} status]
   (println status)
@@ -89,6 +71,9 @@
     (when task (.run task)))
   [state (get-handshake-status ssl-engine)])
 
+(defmethod handshake [:NOT_HANDSHAKING] [state status]
+  (reduced [state status]))
+
 (defmethod handshake :default [{:keys [ssl-engine] :as state} status]
   (println "here" (get-handshake-status ssl-engine) status)
   (reduced [state status]))
@@ -96,12 +81,11 @@
 (defn connect
   [host port]
   (System/setProperty "https.protocols" "TLSv1.2")
-  (let [ssl-ctx (doto
-                  (SSLContext/getInstance "TLSv1.2")
-                  (.init nil nil nil))
+  (let [ssl-ctx (SSLContext/getDefault)
         ssl-engine (doto
                      (.createSSLEngine ssl-ctx)
-                     (.setUseClientMode true))
+                     (.setUseClientMode true)
+                     (.setEnableSessionCreation true))
         channel (doto
                   (SocketChannel/open)
                   (.connect (InetSocketAddress. host port))
@@ -127,9 +111,19 @@
                   :app-buffer-dst    app-buffer-dst}
            status (get-handshake-status ssl-engine)]
       (let [result (handshake state status)]
-        (when-not (reduced? result)
+        (if-not (reduced? result)
           (let [[state status] result]
-            (recur state status)))))))
+            (recur state status))
+          (do
+            (.put app-buffer-src (.getBytes "GET /search?q=qwerty HTTP/1.0\r\n"))
+            (.wrap ssl-engine app-buffer-src packet-buffer-dst)
+            (.flip packet-buffer-dst)
+            (.write channel packet-buffer-dst)
+            (.compact packet-buffer-dst)
+            (.read channel packet-buffer-src)
+            (.flip packet-buffer-src)
+            (.unwrap ssl-engine packet-buffer-src app-buffer-dst)
+            (println (String. (.array app-buffer-dst)))))))))
 
 (defn main
   []
